@@ -41,7 +41,11 @@ class CallIdSanitizerPlugin(Star):
 
         changed += self._sanitize_messages(req.contexts, id_map)
         changed += self._sanitize_tool_calls_result(req.tool_calls_result, id_map)
-        repaired = self._repair_message_tool_call_pairs(req.contexts)
+        extra_answered_ids = self._collect_tool_calls_result_output_ids(req.tool_calls_result)
+        repaired = self._repair_message_tool_call_pairs(
+            req.contexts,
+            extra_answered_ids=extra_answered_ids,
+        )
 
         if changed or repaired:
             logger.info(
@@ -170,13 +174,21 @@ class CallIdSanitizerPlugin(Star):
                     changed += self._sanitize_nested_content(value, id_map)
         return changed
 
-    def _repair_message_tool_call_pairs(self, messages: Any) -> int:
+    def _repair_message_tool_call_pairs(
+        self,
+        messages: Any,
+        extra_answered_ids: set[str] | None = None,
+    ) -> int:
         """Repair tool-call history in both directions before provider requests."""
         if not isinstance(messages, list):
             return 0
 
+        extra_answered_ids = extra_answered_ids or set()
         repaired = 0
-        repaired += self._drop_unanswered_assistant_tool_calls(messages)
+        repaired += self._drop_unanswered_assistant_tool_calls(
+            messages,
+            extra_answered_ids=extra_answered_ids,
+        )
 
         valid_ids = self._collect_assistant_call_ids(messages)
         if not valid_ids:
@@ -195,12 +207,17 @@ class CallIdSanitizerPlugin(Star):
         messages[:] = kept_messages
         return repaired
 
-    def _drop_unanswered_assistant_tool_calls(self, messages: list[Any]) -> int:
+    def _drop_unanswered_assistant_tool_calls(
+        self,
+        messages: list[Any],
+        extra_answered_ids: set[str] | None = None,
+    ) -> int:
         dropped = 0
+        extra_answered_ids = extra_answered_ids or set()
         for index, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 continue
-            answered_ids = self._following_tool_result_ids(messages, index)
+            answered_ids = self._following_tool_result_ids(messages, index) | extra_answered_ids
             dropped += self._filter_assistant_tool_calls(msg, answered_ids)
         return dropped
 
@@ -306,6 +323,35 @@ class CallIdSanitizerPlugin(Star):
             isinstance(part, dict) and part.get("type") in {"function_call_output", "tool_result"}
             for part in content
         )
+
+    def _collect_tool_calls_result_output_ids(self, tool_calls_result: Any) -> set[str]:
+        """Collect tool result IDs from ProviderRequest.tool_calls_result.
+
+        AstrBot appends req.tool_calls_result to provider messages after
+        req.contexts. Those results must be considered when deciding whether an
+        assistant tool_call in contexts is answered; otherwise this plugin may
+        strip a valid in-flight tool_call and leave an orphan tool result.
+        """
+        ids: set[str] = set()
+        if not tool_calls_result:
+            return ids
+        items = tool_calls_result if isinstance(tool_calls_result, list) else [tool_calls_result]
+        for item in items:
+            if isinstance(item, dict):
+                ids.update(self._tool_result_ids(item))
+                ids.update(self._collect_tool_result_ids_from_messages(item.get("tool_calls_result")))
+                continue
+            ids.update(self._collect_tool_result_ids_from_messages(getattr(item, "tool_calls_result", None)))
+        return ids
+
+    def _collect_tool_result_ids_from_messages(self, messages: Any) -> set[str]:
+        ids: set[str] = set()
+        if not messages:
+            return ids
+        items = messages if isinstance(messages, list) else [messages]
+        for msg in items:
+            ids.update(self._tool_result_ids(msg))
+        return ids
 
     def _sanitize_tool_calls_result(self, tool_calls_result: Any, id_map: dict[str, str]) -> int:
         if not tool_calls_result:
