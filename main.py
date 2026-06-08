@@ -22,7 +22,7 @@ PREFIX = "tc_"
 
 @register(
     "astrbot_plugin_callid_sanitizer",
-    "Kurisu",
+    "牧濑红莉栖（BOT）",
     "Sanitize overlong tool_call_id / call_id before LLM requests.",
     "1.2.1",
 )

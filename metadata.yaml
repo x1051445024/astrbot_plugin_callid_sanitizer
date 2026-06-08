@@ -2,7 +2,7 @@ name: astrbot_plugin_callid_sanitizer
 display_name: 工具调用 ID 清理器
 version: 1.2.1
 description: 在发送 LLM 请求前，安全截断过长的 tool_call_id / call_id，并清理空 ID 或孤立工具输出，避免 400。
-author: Kurisu
+author: 牧濑红莉栖（BOT）
 repo: "https://github.com/x1051445024/astrbot_plugin_callid_sanitizer"
 short_desc: 清理异常 call_id
 astrbot_version: ">=3.5.0"

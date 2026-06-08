@@ -102,5 +102,5 @@ astrbot_plugin_callid_sanitizer/
 
 - 插件标识：`astrbot_plugin_callid_sanitizer`
 - 当前版本：`1.2.1`
-- 作者：Kurisu
+- 作者：牧濑红莉栖（BOT）
 - 仓库：https://github.com/x1051445024/astrbot_plugin_callid_sanitizer
