@@ -24,7 +24,7 @@ PREFIX = "tc_"
     "astrbot_plugin_callid_sanitizer",
     "Kurisu",
     "Sanitize overlong tool_call_id / call_id before LLM requests.",
-    "1.2.0",
+    "1.2.1",
 )
 class CallIdSanitizerPlugin(Star):
     def __init__(self, context: Context):
@@ -41,17 +41,19 @@ class CallIdSanitizerPlugin(Star):
 
         changed += self._sanitize_messages(req.contexts, id_map)
         changed += self._sanitize_tool_calls_result(req.tool_calls_result, id_map)
+        removed_invalid_results = self._drop_invalid_tool_calls_result_outputs(req)
         extra_answered_ids = self._collect_tool_calls_result_output_ids(req.tool_calls_result)
         repaired = self._repair_message_tool_call_pairs(
             req.contexts,
             extra_answered_ids=extra_answered_ids,
         )
 
-        if changed or repaired:
+        removed_outputs = repaired + removed_invalid_results
+        if changed or removed_outputs:
             logger.info(
-                "[callid_sanitizer] sanitized %s overlong tool call id reference(s), removed_orphan_outputs=%s, map_size=%s",
+                "[callid_sanitizer] sanitized %s overlong tool call id reference(s), removed_outputs=%s, map_size=%s",
                 changed,
-                repaired,
+                removed_outputs,
                 len(id_map),
             )
 
@@ -99,7 +101,7 @@ class CallIdSanitizerPlugin(Star):
         changed = 0
 
         if isinstance(msg, dict):
-            for key in ("tool_call_id", "call_id"):
+            for key in ("tool_call_id", "call_id", "tool_use_id"):
                 if key in msg:
                     msg[key], delta = self._sanitize_value(msg.get(key), id_map)
                     changed += delta
@@ -114,7 +116,7 @@ class CallIdSanitizerPlugin(Star):
             return changed
 
         # Pydantic/dataclass Message-like objects used inside AstrBot.
-        for attr in ("tool_call_id", "call_id"):
+        for attr in ("tool_call_id", "call_id", "tool_use_id"):
             if hasattr(msg, attr):
                 old = getattr(msg, attr, None)
                 new, delta = self._sanitize_value(old, id_map)
@@ -134,14 +136,10 @@ class CallIdSanitizerPlugin(Star):
     def _sanitize_tool_call(self, tool_call: Any, id_map: dict[str, str]) -> int:
         changed = 0
         if isinstance(tool_call, dict):
-            if "id" in tool_call:
-                tool_call["id"], delta = self._sanitize_value(tool_call.get("id"), id_map)
-                changed += delta
-            if "tool_call_id" in tool_call:
-                tool_call["tool_call_id"], delta = self._sanitize_value(
-                    tool_call.get("tool_call_id"), id_map
-                )
-                changed += delta
+            for key in ("id", "tool_call_id", "call_id", "tool_use_id"):
+                if key in tool_call:
+                    tool_call[key], delta = self._sanitize_value(tool_call.get(key), id_map)
+                    changed += delta
             return changed
 
         for attr in ("id", "tool_call_id", "call_id"):
@@ -200,9 +198,10 @@ class CallIdSanitizerPlugin(Star):
         for msg in messages:
             if self._is_tool_output_message(msg):
                 result_ids = self._tool_result_ids(msg)
-                if result_ids and not (result_ids & valid_ids):
+                if not result_ids or not (result_ids & valid_ids):
                     repaired += 1
                     continue
+                repaired += self._filter_tool_output_parts(msg, valid_ids)
             kept_messages.append(msg)
         messages[:] = kept_messages
         return repaired
@@ -243,7 +242,7 @@ class CallIdSanitizerPlugin(Star):
                     call_id = tool_call.get("id") or tool_call.get("call_id")
                 else:
                     call_id = getattr(tool_call, "id", None) or getattr(tool_call, "call_id", None)
-                if call_id and str(call_id) in answered_ids:
+                if self._has_non_empty_id(call_id) and str(call_id).strip() in answered_ids:
                     kept.append(tool_call)
                 else:
                     dropped += 1
@@ -262,9 +261,9 @@ class CallIdSanitizerPlugin(Star):
                     part_ids = set()
                     for key in ("call_id", "id", "tool_call_id"):
                         value = part.get(key)
-                        if value:
-                            part_ids.add(str(value))
-                    if part_ids and not (part_ids & answered_ids):
+                        if self._has_non_empty_id(value):
+                            part_ids.add(str(value).strip())
+                    if not part_ids or not (part_ids & answered_ids):
                         dropped += 1
                         continue
                 filtered.append(part)
@@ -281,16 +280,16 @@ class CallIdSanitizerPlugin(Star):
                 for tool_call in tool_calls:
                     if isinstance(tool_call, dict):
                         call_id = tool_call.get("id") or tool_call.get("call_id")
-                        if call_id:
-                            ids.add(str(call_id))
+                        if self._has_non_empty_id(call_id):
+                            ids.add(str(call_id).strip())
             content = msg.get("content")
             if isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") in {"function_call", "tool_use"}:
                         for key in ("call_id", "id", "tool_call_id"):
                             value = part.get(key)
-                            if value:
-                                ids.add(str(value))
+                            if self._has_non_empty_id(value):
+                                ids.add(str(value).strip())
         return ids
 
     def _tool_result_ids(self, msg: Any) -> set[str]:
@@ -299,17 +298,45 @@ class CallIdSanitizerPlugin(Star):
             return ids
         for key in ("tool_call_id", "call_id", "tool_use_id"):
             value = msg.get(key)
-            if value:
-                ids.add(str(value))
+            if self._has_non_empty_id(value):
+                ids.add(str(value).strip())
         content = msg.get("content")
         if isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and part.get("type") in {"function_call_output", "tool_result"}:
                     for key in ("call_id", "tool_call_id", "tool_use_id"):
                         value = part.get(key)
-                        if value:
-                            ids.add(str(value))
+                        if self._has_non_empty_id(value):
+                            ids.add(str(value).strip())
         return ids
+
+    def _filter_tool_output_parts(self, msg: dict[str, Any], valid_ids: set[str]) -> int:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return 0
+        filtered = []
+        dropped = 0
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in {"function_call_output", "tool_result"}:
+                part_ids = self._tool_output_part_ids(part)
+                if not part_ids or not (part_ids & valid_ids):
+                    dropped += 1
+                    continue
+            filtered.append(part)
+        msg["content"] = filtered
+        return dropped
+
+    def _tool_output_part_ids(self, part: dict[str, Any]) -> set[str]:
+        ids: set[str] = set()
+        for key in ("call_id", "tool_call_id", "tool_use_id"):
+            value = part.get(key)
+            if self._has_non_empty_id(value):
+                ids.add(str(value).strip())
+        return ids
+
+    @staticmethod
+    def _has_non_empty_id(value: Any) -> bool:
+        return value is not None and bool(str(value).strip())
 
     def _is_tool_output_message(self, msg: Any) -> bool:
         if not isinstance(msg, dict):
@@ -352,6 +379,47 @@ class CallIdSanitizerPlugin(Star):
         for msg in items:
             ids.update(self._tool_result_ids(msg))
         return ids
+
+    def _drop_invalid_tool_calls_result_outputs(self, req: ProviderRequest) -> int:
+        valid_ids = self._collect_assistant_call_ids(getattr(req, "contexts", None) or [])
+        if not valid_ids:
+            return 0
+        return self._drop_invalid_tool_outputs_from_container(
+            getattr(req, "tool_calls_result", None),
+            valid_ids,
+        )
+
+    def _drop_invalid_tool_outputs_from_container(self, container: Any, valid_ids: set[str]) -> int:
+        if not container:
+            return 0
+        if isinstance(container, list):
+            dropped = 0
+            kept = []
+            for item in container:
+                if isinstance(item, dict) and self._is_tool_output_message(item):
+                    result_ids = self._tool_result_ids(item)
+                    if not result_ids or not (result_ids & valid_ids):
+                        dropped += 1
+                        continue
+                    dropped += self._filter_tool_output_parts(item, valid_ids)
+                else:
+                    dropped += self._drop_invalid_tool_outputs_from_container(item, valid_ids)
+                kept.append(item)
+            container[:] = kept
+            return dropped
+        if isinstance(container, dict):
+            dropped = 0
+            for key in ("tool_calls_result", "contexts", "messages"):
+                value = container.get(key)
+                if isinstance(value, list):
+                    dropped += self._drop_invalid_tool_outputs_from_container(value, valid_ids)
+            if self._is_tool_output_message(container):
+                dropped += self._filter_tool_output_parts(container, valid_ids)
+            return dropped
+        nested = getattr(container, "tool_calls_result", None)
+        if isinstance(nested, list):
+            return self._drop_invalid_tool_outputs_from_container(nested, valid_ids)
+        return 0
 
     def _sanitize_tool_calls_result(self, tool_calls_result: Any, id_map: dict[str, str]) -> int:
         if not tool_calls_result:
